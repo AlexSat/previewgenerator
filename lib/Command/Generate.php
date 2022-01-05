@@ -36,6 +36,9 @@ use OCP\IConfig;
 use OCP\IPreview;
 use OCP\IUser;
 use OCP\IUserManager;
+use OCA\Files_External\Service\GlobalStoragesService;
+use Psr\Container\ContainerExceptionInterface;
+use Psr\Container\ContainerInterface;
 use Symfony\Component\Console\Command\Command;
 use Symfony\Component\Console\Input\InputArgument;
 use Symfony\Component\Console\Input\InputInterface;
@@ -43,6 +46,9 @@ use Symfony\Component\Console\Input\InputOption;
 use Symfony\Component\Console\Output\OutputInterface;
 
 class Generate extends Command {
+
+	/** @var ?GlobalStoragesService */
+	protected $globalService;
 
 	/** @var IUserManager */
 	protected $userManager;
@@ -69,7 +75,8 @@ class Generate extends Command {
 								IUserManager $userManager,
 								IPreview $previewGenerator,
 								IConfig $config,
-								IManager $encryptionManager) {
+								IManager $encryptionManager,
+								ContainerInterface $container) {
 		parent::__construct();
 
 		$this->userManager = $userManager;
@@ -77,6 +84,12 @@ class Generate extends Command {
 		$this->previewGenerator = $previewGenerator;
 		$this->config = $config;
 		$this->encryptionManager = $encryptionManager;
+
+		try {
+			$this->globalService = $container->get(GlobalStoragesService::class);
+		} catch (ContainerExceptionInterface $e) {
+			$this->globalService = null;
+		}
 	}
 
 	protected function configure() {
@@ -85,13 +98,13 @@ class Generate extends Command {
 			->setDescription('Generate previews')
 			->addArgument(
 				'user_id',
-				InputArgument::OPTIONAL,
-				'Generate previews for the given user'
+				InputArgument::OPTIONAL | InputArgument::IS_ARRAY,
+				'Generate previews for the given user(s)'
 			)->addOption(
 				'path',
 				'p',
-				InputOption::VALUE_OPTIONAL,
-				'limit scan to this path, eg. --path="/alice/files/Photos", the user_id is determined by the path and the user_id parameter is ignored'
+				InputOption::VALUE_OPTIONAL | InputOption::VALUE_IS_ARRAY,
+				'limit scan to this path, eg. --path="/alice/files/Photos", the user_id is determined by the path and all user_id arguments are ignored, multiple usages allowed'
 			);
 	}
 
@@ -108,29 +121,51 @@ class Generate extends Command {
 
 		$this->sizes = SizeHelper::calculateSizes($this->config);
 
-		$inputPath = $input->getOption('path');
-		if ($inputPath) {
-			$inputPath = '/' . trim($inputPath, '/');
-			[, $userId,] = explode('/', $inputPath, 3);
-			$user = $this->userManager->get($userId);
-			if ($user !== null) {
-				$this->generatePathPreviews($user, $inputPath);
+		$inputPaths = $input->getOption('path');
+		if ($inputPaths) {
+			foreach ($inputPaths as $inputPath) {
+				$inputPath = '/' . trim($inputPath, '/');
+				[, $userId,] = explode('/', $inputPath, 3);
+				$user = $this->userManager->get($userId);
+				if ($user !== null) {
+					$this->generatePathPreviews($user, $inputPath);
+				}
 			}
 		} else {
-			$userId = $input->getArgument('user_id');
-			if ($userId === null) {
+			$userIds = $input->getArgument('user_id');
+			if (count($userIds) === 0) {
 				$this->userManager->callForSeenUsers(function (IUser $user) {
 					$this->generateUserPreviews($user);
 				});
 			} else {
-				$user = $this->userManager->get($userId);
-				if ($user !== null) {
-					$this->generateUserPreviews($user);
+				foreach ($userIds as $userId) {
+					$user = $this->userManager->get($userId);
+					if ($user !== null) {
+						$this->generateUserPreviews($user);
+					}
 				}
 			}
 		}
 
 		return 0;
+	}
+
+	private function getNoPreviewMountPaths(IUser $user): array {
+		if ($this->globalService === null) {
+			return [];
+		}
+		$mountPaths = [];
+		$userId = $user->getUID();
+		$mounts = $this->globalService->getStorageForAllUsers();
+		foreach ($mounts as $mount) {
+			if (in_array($userId, $mount->getApplicableUsers()) &&
+				$mount->getMountOptions()['previews'] === false
+			) {
+				$userFolder = $this->rootFolder->getUserFolder($userId)->getPath();
+				array_push($mountPaths, $userFolder.$mount->getMountPoint());
+			}
+		}
+		return $mountPaths;
 	}
 
 	private function generatePathPreviews(IUser $user, string $path) {
@@ -144,7 +179,8 @@ class Generate extends Command {
 			return;
 		}
 		$pathFolder = $userFolder->get($relativePath);
-		$this->parseFolder($pathFolder);
+		$noPreviewMountPaths = $this->getNoPreviewMountPaths($user);
+		$this->parseFolder($pathFolder, $noPreviewMountPaths);
 	}
 
 	private function generateUserPreviews(IUser $user) {
@@ -152,24 +188,28 @@ class Generate extends Command {
 		\OC_Util::setupFS($user->getUID());
 
 		$userFolder = $this->rootFolder->getUserFolder($user->getUID());
-		$this->parseFolder($userFolder);
+		$noPreviewMountPaths = $this->getNoPreviewMountPaths($user);
+		$this->parseFolder($userFolder, $noPreviewMountPaths);
 	}
 
-	private function parseFolder(Folder $folder) {
+	private function parseFolder(Folder $folder, array $noPreviewMountPaths): void {
 		try {
+			$folderPath = $folder->getPath();
+
 			// Respect the '.nomedia' file. If present don't traverse the folder
-			if ($folder->nodeExists('.nomedia')) {
-				$this->output->writeln('Skipping folder ' . $folder->getPath());
+			// Same for external mounts with previews disabled
+			if ($folder->nodeExists('.nomedia') || in_array($folderPath, $noPreviewMountPaths)) {
+				$this->output->writeln('Skipping folder ' . $folderPath);
 				return;
 			}
 
-			$this->output->writeln('Scanning folder ' . $folder->getPath());
+			$this->output->writeln('Scanning folder ' . $folderPath);
 
 			$nodes = $folder->getDirectoryListing();
 
 			foreach ($nodes as $node) {
 				if ($node instanceof Folder) {
-					$this->parseFolder($node);
+					$this->parseFolder($node, $noPreviewMountPaths);
 				} elseif ($node instanceof File) {
 					$this->parseFile($node);
 				}

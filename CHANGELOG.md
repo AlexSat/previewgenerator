@@ -1,6 +1,19 @@
-## 3.1.2 -2021-06-30
+## 3.4.1 - 2021-12-15
+### Fixed
+- Dependency error on Nextcloud 20
+
+## 3.4.0 - 2021-12-06
 ### Added
-- Added returning only rendered previews (configuring by setting 'enable_generated_previews_only': bool)
+- Skip external mounts with disabled previews (thanks to @hashworks)
+- Allow multiple paths and user ids (thanks to @hammer065)
+
+## 3.3.0 - 2021-11-30
+### Added
+- Nextcloud 23 support
+
+## 3.2.0 - 2021-11-09
+### Added
+- Nextcloud 22 support
 
 ## 3.1.1 - 2021-01-27
 ### Changed
